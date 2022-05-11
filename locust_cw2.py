@@ -1,7 +1,11 @@
 # encoding: utf-8
 
-from locust import HttpLocust, TaskSet, task, events, web, main
+from locust import HttpLocust, TaskSet, task, events, web, main, User, runners
+# from locust.runners import locust_runner
 import time, datetime, logging, boto3, os, sys, json  #moved this line AFTER locust imports - https://github.com/gevent/gevent/issues/1016
+from botocore.config import Config
+import argparse
+
 import queue
 
 import inspect
@@ -14,6 +18,7 @@ log = logging.getLogger()
 CW_METRICS_NAMESPACE="concurrencylabs/loadtests/locust"
 CW_LOGS_LOG_GROUP="LocustTests"
 CW_LOGS_LOG_STREAM="load-generator"
+AWS_REGION = "ap-northeast-2"
 #_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
 
 STATUS_SUCCESS = "SUCCESS"
@@ -34,6 +39,8 @@ class CloudWatchConnector(object):
         self.iamrolearn = iamrolearn
         self.lastclientrefresh = None
 
+        self.runner = None
+
         self.init_clients()
 
 
@@ -44,21 +51,24 @@ class CloudWatchConnector(object):
         self.cwlogsclient.create_log_stream(logGroupName=self.loggroup,logStreamName=self.logstream)
 
     def init_clients(self):
+        boto3_config = Config(
+            region_name = AWS_REGION
+        )
         if self.iamrolearn:
             log.info("Initializing AWS SDK clients using IAM Role:[{}]".format(self.iamrolearn))
-            stsclient = boto3.client('sts')
+            stsclient = boto3.client('sts', config=boto3_config)
             stsresponse = stsclient.assume_role(RoleArn=self.iamrolearn, RoleSessionName='cwlocustconnector')
             if 'Credentials' in stsresponse:
                 accessKeyId = stsresponse['Credentials']['AccessKeyId']
                 secretAccessKey = stsresponse['Credentials']['SecretAccessKey']
                 sessionToken = stsresponse['Credentials']['SessionToken']
-                self.cwlogsclient = boto3.client('logs',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken)
-                self.cwclient = boto3.client('cloudwatch',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken)
+                self.cwlogsclient = boto3.client('logs',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken, config=boto3_config)
+                self.cwclient = boto3.client('cloudwatch',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken, config=boto3_config)
 
         else:
             log.info("Initializing AWS SDK clients using configured AWS credentials")
-            self.cwlogsclient = boto3.client('logs')
-            self.cwclient = boto3.client('cloudwatch')
+            self.cwlogsclient = boto3.client('logs', config=boto3_config)
+            self.cwclient = boto3.client('cloudwatch', config=boto3_config)
 
         self.lastclientrefresh = datetime.datetime.now()
 
@@ -69,13 +79,15 @@ class CloudWatchConnector(object):
         if len(response['logGroups']): result = True
         return result
 
-    def on_request_success(self, request_type, name, response_time, response_length, **kwargs):
-        request_result = RequestResult(self.host, request_type, name, response_time, response_length, "", STATUS_SUCCESS)
+    def on_request_success(self, user_num, request_type, name, response_time, response_length, **kwargs):
+        
+
+        request_result = RequestResult(self.host, user_num, request_type, name, response_time, response_length, "", STATUS_SUCCESS)
         # print("====> success")
         self.response_queue.put(request_result)
 
-    def on_request_failure(self, request_type, name, response_time, exception, **kwargs):
-        request_result = RequestResult(self.host, request_type, name, response_time, 0, exception, STATUS_FAILURE)
+    def on_request_failure(self, user_num, request_type, name, response_time, exception, **kwargs):
+        request_result = RequestResult(self.host, user_num, request_type, name, response_time, 0, exception, STATUS_FAILURE)
         self.response_queue.put(request_result)
 
     def on_dlt_complete(self, env):
@@ -87,6 +99,12 @@ class CloudWatchConnector(object):
         self.usercount = UserCount(host=self.host, usercount=user_count)
         
         self.start_cw_loop()
+
+    def on_start(self, env):
+        self.runner = env.runner
+
+    def get_runner(self):
+        return self.runner.user_count
 
     def start_cw_loop(self):
         print("start cw loop")
@@ -100,6 +118,12 @@ class CloudWatchConnector(object):
             batch = self.get_batch()
             cw_logs_batch = batch['cw_logs_batch']
             cw_metrics_batch = batch['cw_metrics_batch']
+            # print("batch start.  : ", cw_logs_batch)
+            # print("cw_metrics_batch : ", cw_metrics_batch)
+
+            if len(cw_logs_batch) == 0 and len(cw_metrics_batch) == 0:
+                break
+
             if cw_logs_batch:
                 try:
                     if self.nexttoken:
@@ -135,9 +159,12 @@ class CloudWatchConnector(object):
                 cw_logs_batch.append(request_response.get_cw_logs_record())
                 cw_metrics_batch.append(request_response.get_cw_metrics_status_record())
                 cw_metrics_batch.append(request_response.get_cw_metrics_count_record())
+                cw_metrics_batch.append(request_response.get_cw_metrics_usercount_record())
+
+
                 if request_response.get_cw_metrics_response_size_record():
                     cw_metrics_batch.append(request_response.get_cw_metrics_response_size_record())
-                if self.usercount: cw_metrics_batch.append(self.usercount.get_metric_data())
+                # if self.usercount: cw_metrics_batch.append(self.usercount.get_metric_data())
 
                 self.response_queue.task_done()
             log.debug("Queue size:["+str(self.response_queue.qsize())+"]")
@@ -146,7 +173,7 @@ class CloudWatchConnector(object):
         return result
 
 class RequestResult(object):
-    def __init__(self, host, request_type, name, response_time, response_length, exception, status):
+    def __init__(self, host, user_num, request_type, name, response_time, response_length, exception, status):
         self.timestamp = datetime.datetime.utcnow()
         self.request_type = request_type
         self.name = name
@@ -155,15 +182,17 @@ class RequestResult(object):
         self.host = host
         self.exception = exception
         self.status = status
+        self.user_num = user_num
 
     def get_cw_logs_record(self):
+        
         record = {}
-        timestamp = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S.%f UTC")#example: 2016/02/08 16:51:05.123456 CST
+        timestamp = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S.%f UTC")
         message = ""
         if self.status == STATUS_SUCCESS:
-            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [response_length={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.response_length)
+            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [response_length={}] [user={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.response_length, self.user_num)
         if self.status == STATUS_FAILURE:
-            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [exception={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.exception)
+            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [exception={}] [user={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.exception, self.user_num)
         record = {'timestamp': self.get_seconds()*1000,'message': message}
         return record
 
@@ -223,6 +252,16 @@ class RequestResult(object):
                   }
         return result
 
+    def get_cw_metrics_usercount_record(self):
+        dimensions = self.get_metric_dimensions()
+        result = {
+                'MetricName': 'UserCount',
+                'Dimensions': dimensions,
+                'Timestamp': self.timestamp,
+                'Value': self.user_num,
+                'Unit': 'Count'
+                  }
+        return result
 
 
     def get_metric_dimensions(self):
@@ -234,6 +273,12 @@ class RequestResult(object):
         epoch = datetime.datetime.utcfromtimestamp(0)
         return int((self.timestamp - epoch).total_seconds())
 
+class MyUser(User):
+    def __init__(self, environment):
+        self.environment = environment
+
+    def get_current_user(self):
+        print("get user!")
 
 class UserCount(object):
     def __init__(self, host,  usercount):
@@ -250,28 +295,45 @@ class UserCount(object):
 
         return result
 
+
 @events.request.add_listener
 def my_req_handler(request_type, name, response_time, response_length, response,
                        context, exception, start_time, url, **kwargs):
 
+    
+    # print("-> current runner : ", cwconn.get_runner())
+    current_user_count = cwconn.get_runner()
+
     # Failure
     if exception:
         # print(f"Request to {name} failed with exception {exception}")
-        cwconn.on_request_failure(request_type, name, response_time, exception, **kwargs)
+        cwconn.on_request_failure(current_user_count, request_type, name, response_time, exception, **kwargs)
     # Success
     else:
         # print(f"Successfully made a request to: {name}")
         # print(f"The response was {response.text}")
         # print(f"The response len {len(response.text)}")
-        cwconn.on_request_success(request_type, name, response_time, response_length, **kwargs)
+        cwconn.on_request_success(current_user_count, request_type, name, response_time, response_length, **kwargs)
 
 @events.quitting.add_listener 
 def dlt_complete_handler(environment, **kargs):
     cwconn.on_dlt_complete(environment)
-    self.usercount = UserCount(host=self.host, usercount=user_count)
-    self.start_cw_loop()
+    
 
     print("dlt completed")
+
+@events.spawning_complete.add_listener
+def spawning_check(user_count, **kwargs):
+    print("spawning completed : ", user_count)
+
+@events.test_start.add_listener
+def on_locust_init(environment, **_kwargs):
+    cwconn.on_start(environment)
+    
+
+# @events.init_command_line_parser.add_listener
+# def _(parser):
+#     parser.add_argument("--live", type=str, env_var="LOCUST_MY_ARGUMENT", default="", help="It's working")
 
 
 if __name__ == "__main__":
@@ -290,6 +352,7 @@ if __name__ == "__main__":
 #    if 'IAM_ROLE_ARN' in os.environ:
 #        iamrolearn = os.environ['IAM_ROLE_ARN']
 
+   
 
    cwconn = CloudWatchConnector(host=host, namespace=CW_METRICS_NAMESPACE,loggroup=CW_LOGS_LOG_GROUP,logstream=CW_LOGS_LOG_STREAM, iamrolearn=iamrolearn)
 
