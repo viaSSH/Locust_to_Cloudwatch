@@ -2,10 +2,10 @@
 
 from locust import HttpLocust, TaskSet, task, events, web, main, User, runners
 # from locust.runners import locust_runner
-import time, datetime, logging, boto3, os, sys, json  #moved this line AFTER locust imports - https://github.com/gevent/gevent/issues/1016
+import time, datetime, logging, boto3, os, sys, json  
 from botocore.config import Config
 import argparse
-
+import multiprocessing
 import queue
 
 import inspect
@@ -14,11 +14,12 @@ log = logging.getLogger()
 
 
 #_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
-#CONFIG VALUES - feel free to update
+#CONFIG VALUES 
 CW_METRICS_NAMESPACE="concurrencylabs/loadtests/locust"
 CW_LOGS_LOG_GROUP="LocustTests"
 CW_LOGS_LOG_STREAM="load-generator"
 AWS_REGION = "ap-northeast-2"
+IAM_ROLE_ARN = "arn:aws:iam::336481557929:role/ec2AndCloudwatchFull"
 #_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
 
 STATUS_SUCCESS = "SUCCESS"
@@ -33,6 +34,8 @@ class CloudWatchConnector(object):
         self.namespace = namespace #the same namespace is used for both CW Logs and Metrics
         self.nexttoken = ""
         self.response_queue = queue.Queue()
+        self.queue_tick = round(time.time()*1000)
+        self.tick_flag = True
         self.batch_size = 5
         self.host = host
         self.usercount = None
@@ -40,7 +43,7 @@ class CloudWatchConnector(object):
         self.lastclientrefresh = None
 
         self.runner = None
-
+        self.live_upload = False
         self.init_clients()
 
 
@@ -91,26 +94,57 @@ class CloudWatchConnector(object):
         self.response_queue.put(request_result)
 
     def on_dlt_complete(self, env):
-        
-        # print(inspect.getmembers(env.runner))
-        # print(dir(env.runner))
-        user_count = env.runner.target_user_count
-        print("user count : ", user_count)
         self.usercount = UserCount(host=self.host, usercount=user_count)
         
         self.start_cw_loop()
 
     def on_start(self, env):
         self.runner = env.runner
+        self.live_upload = env.parsed_options.live
+        print("Live Upload Mode: ",self.live_upload)
 
     def get_runner(self):
         return self.runner.user_count
 
+    def live_post(self):
+        
+        if self.tick_flag == True and self.response_queue.qsize() >= self.batch_size and round(time.time()*1000) - self.queue_tick > 100:
+            print("live post time : ", round(time.time()*1000), " left batch : ", self.response_queue.qsize())
+            self.tick_flag = False
+            batch = self.get_batch()
+            cw_logs_batch = batch['cw_logs_batch']
+            cw_metrics_batch = batch['cw_metrics_batch']
+
+            if cw_logs_batch:
+                try:
+                    if self.nexttoken:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch,
+                            sequenceToken=self.nexttoken
+                        )
+                    else:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch
+                        )
+                    if 'nextSequenceToken' in response: self.nexttoken = response['nextSequenceToken']
+                except Exception as e:
+                    log.error(str(e))
+
+            if cw_metrics_batch:
+                try:
+                    cwresponse = self.cwclient.put_metric_data(Namespace=self.namespace,MetricData=cw_metrics_batch)
+                    log.debug("PutMetricData response: [{}]".format(json.dumps(cwresponse, indent=4)))
+                except Exception as e:
+                    log.error(str(e))
+            self.queue_tick = round(time.time()*1000)
+            self.tick_flag = True
+
     def start_cw_loop(self):
-        print("start cw loop")
+        print("Start CW Loop. left Queue : ", self.response_queue.qsize(), " left time : ", self.response_queue.qsize()/5*0.1, "s")
         while True:
             awsclientage = datetime.datetime.now() - self.lastclientrefresh
-            #Refresh AWS clients every 50 minutes, if using an IAM Role (since credentials expire in 1hr)
             if self.iamrolearn and awsclientage.total_seconds() > 50*60 :
                 self.init_clients()
 
@@ -122,6 +156,7 @@ class CloudWatchConnector(object):
             # print("cw_metrics_batch : ", cw_metrics_batch)
 
             if len(cw_logs_batch) == 0 and len(cw_metrics_batch) == 0:
+                print("break loop")
                 break
 
             if cw_logs_batch:
@@ -300,7 +335,6 @@ class UserCount(object):
 def my_req_handler(request_type, name, response_time, response_length, response,
                        context, exception, start_time, url, **kwargs):
 
-    
     # print("-> current runner : ", cwconn.get_runner())
     current_user_count = cwconn.get_runner()
 
@@ -315,12 +349,14 @@ def my_req_handler(request_type, name, response_time, response_length, response,
         # print(f"The response len {len(response.text)}")
         cwconn.on_request_success(current_user_count, request_type, name, response_time, response_length, **kwargs)
 
+    if cwconn.live_upload:
+        cwconn.live_post()
+
 @events.quitting.add_listener 
 def dlt_complete_handler(environment, **kargs):
     cwconn.on_dlt_complete(environment)
-    
 
-    print("dlt completed")
+    print("Distribute Load Test Completed")
 
 @events.spawning_complete.add_listener
 def spawning_check(user_count, **kwargs):
@@ -331,30 +367,22 @@ def on_locust_init(environment, **_kwargs):
     cwconn.on_start(environment)
     
 
-# @events.init_command_line_parser.add_listener
-# def _(parser):
-#     parser.add_argument("--live", type=str, env_var="LOCUST_MY_ARGUMENT", default="", help="It's working")
+@events.init_command_line_parser.add_listener
+def _(parser):
+    parser.add_argument("--live", default=False, type=bool, help="live posting")
 
 
 if __name__ == "__main__":
 
-   #parser, options, arguments = main.parse_options()
-#    parser, options = main.parse_options()
-
    host = 'http://exam.viassh.com'
-#    if options.host:
-#        host = options.host
 
-   #this parameter is supported in case the load generator publishes metrics to CloudWatch in a different AWS account
-   iamrolearn = 'arn:aws:iam::336481557929:role/ec2AndCloudwatchFull'
+   iamrolearn = IAM_ROLE_ARN
 
    
 #    if 'IAM_ROLE_ARN' in os.environ:
 #        iamrolearn = os.environ['IAM_ROLE_ARN']
 
-   
 
    cwconn = CloudWatchConnector(host=host, namespace=CW_METRICS_NAMESPACE,loggroup=CW_LOGS_LOG_GROUP,logstream=CW_LOGS_LOG_STREAM, iamrolearn=iamrolearn)
-
 
    main.main()
