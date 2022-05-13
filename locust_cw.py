@@ -1,27 +1,214 @@
 # encoding: utf-8
 
-from locust import HttpLocust, TaskSet, task, events, web, main
-import time, datetime, logging, boto3, os, sys, json  #moved this line AFTER locust imports - https://github.com/gevent/gevent/issues/1016
+from locust import HttpLocust, TaskSet, task, events, web, main, User, runners
+# from locust.runners import locust_runner
+import time, datetime, logging, boto3, os, sys, json  
+from botocore.config import Config
+import argparse
+import multiprocessing
 import queue
+
+import inspect
 
 log = logging.getLogger()
 
 
 #_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
-#CONFIG VALUES - feel free to update
-CW_METRICS_NAMESPACE="concurrencylabs/loadtests/locust"
+#CONFIG VALUES 
+CW_METRICS_NAMESPACE="viassh/loadtests/locust"
 CW_LOGS_LOG_GROUP="LocustTests"
 CW_LOGS_LOG_STREAM="load-generator"
+AWS_REGION = "ap-northeast-2"
+IAM_ROLE_ARN = "arn:aws:iam::336481557929:role/ec2AndCloudwatchFull"
 #_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
-
-#See https://github.com/concurrencylabs/locust-cloudwatch
 
 STATUS_SUCCESS = "SUCCESS"
 STATUS_FAILURE = "FAILURE"
 
+class CloudWatchConnector(object):
+
+    def __init__(self, host, namespace, loggroup, logstream, iamrolearn):
+        seq = datetime.datetime.now().microsecond
+        self.loggroup = loggroup
+        self.logstream = logstream + "_" + str(seq)
+        self.namespace = namespace #the same namespace is used for both CW Logs and Metrics
+        self.nexttoken = ""
+        self.response_queue = queue.Queue()
+        self.queue_tick = round(time.time()*1000)
+        self.tick_flag = True
+        self.batch_size = 5
+        self.host = host
+        self.usercount = None
+        self.iamrolearn = iamrolearn
+        self.lastclientrefresh = None
+
+        self.runner = None
+        self.live_upload = False
+        self.init_clients()
+
+
+
+        if not self.loggroup_exists():
+            self.cwlogsclient.create_log_group(logGroupName=self.loggroup)
+
+        self.cwlogsclient.create_log_stream(logGroupName=self.loggroup,logStreamName=self.logstream)
+
+    def init_clients(self):
+        boto3_config = Config(
+            region_name = AWS_REGION
+        )
+        if self.iamrolearn:
+            log.info("Initializing AWS SDK clients using IAM Role:[{}]".format(self.iamrolearn))
+            stsclient = boto3.client('sts', config=boto3_config)
+            stsresponse = stsclient.assume_role(RoleArn=self.iamrolearn, RoleSessionName='cwlocustconnector')
+            if 'Credentials' in stsresponse:
+                accessKeyId = stsresponse['Credentials']['AccessKeyId']
+                secretAccessKey = stsresponse['Credentials']['SecretAccessKey']
+                sessionToken = stsresponse['Credentials']['SessionToken']
+                self.cwlogsclient = boto3.client('logs',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken, config=boto3_config)
+                self.cwclient = boto3.client('cloudwatch',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken, config=boto3_config)
+
+        else:
+            log.info("Initializing AWS SDK clients using configured AWS credentials")
+            self.cwlogsclient = boto3.client('logs', config=boto3_config)
+            self.cwclient = boto3.client('cloudwatch', config=boto3_config)
+
+        self.lastclientrefresh = datetime.datetime.now()
+
+
+    def loggroup_exists(self):
+        result = False
+        response = self.cwlogsclient.describe_log_groups(logGroupNamePrefix=self.loggroup, limit=1)
+        if len(response['logGroups']): result = True
+        return result
+
+    def on_request_success(self, user_num, request_type, name, response_time, response_length, **kwargs):
+        
+
+        request_result = RequestResult(self.host, user_num, request_type, name, response_time, response_length, "", STATUS_SUCCESS)
+        # print("====> success")
+        self.response_queue.put(request_result)
+
+    def on_request_failure(self, user_num, request_type, name, response_time, exception, **kwargs):
+        request_result = RequestResult(self.host, user_num, request_type, name, response_time, 0, exception, STATUS_FAILURE)
+        self.response_queue.put(request_result)
+
+    def on_dlt_complete(self, env):
+        # self.usercount = UserCount(host=self.host, usercount=user_count)
+        
+        self.start_cw_loop()
+
+    def on_start(self, env):
+        self.runner = env.runner
+        self.live_upload = env.parsed_options.live
+        print("Live Upload Mode: ",self.live_upload)
+
+    def get_runner(self):
+        return self.runner.user_count
+
+    def live_post(self):
+        
+        if self.tick_flag == True and self.response_queue.qsize() >= self.batch_size and round(time.time()*1000) - self.queue_tick > 20:
+            # print("live post time : ", round(time.time()*1000), " left batch : ", self.response_queue.qsize())
+            self.tick_flag = False
+            batch = self.get_batch()
+            cw_logs_batch = batch['cw_logs_batch']
+            cw_metrics_batch = batch['cw_metrics_batch']
+
+            if cw_logs_batch:
+                try:
+                    if self.nexttoken:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch,
+                            sequenceToken=self.nexttoken
+                        )
+                    else:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch
+                        )
+                    if 'nextSequenceToken' in response: self.nexttoken = response['nextSequenceToken']
+                except Exception as e:
+                    log.error(str(e))
+
+            if cw_metrics_batch:
+                try:
+                    cwresponse = self.cwclient.put_metric_data(Namespace=self.namespace,MetricData=cw_metrics_batch)
+                    log.debug("PutMetricData response: [{}]".format(json.dumps(cwresponse, indent=4)))
+                except Exception as e:
+                    log.error(str(e))
+            self.queue_tick = round(time.time()*1000)
+            self.tick_flag = True
+
+    def start_cw_loop(self):
+        print("Start CW Loop. left Queue : ", self.response_queue.qsize(), " left time : ", self.response_queue.qsize()/5*0.1, "s")
+        while True:
+            awsclientage = datetime.datetime.now() - self.lastclientrefresh
+            if self.iamrolearn and awsclientage.total_seconds() > 50*60 :
+                self.init_clients()
+
+            time.sleep(.1)
+            batch = self.get_batch()
+            cw_logs_batch = batch['cw_logs_batch']
+            cw_metrics_batch = batch['cw_metrics_batch']
+            # print("batch start.  : ", cw_logs_batch)
+            # print("cw_metrics_batch : ", cw_metrics_batch)
+
+            if len(cw_logs_batch) == 0 and len(cw_metrics_batch) == 0:
+                print("break loop")
+                break
+
+            if cw_logs_batch:
+                try:
+                    if self.nexttoken:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch,
+                            sequenceToken=self.nexttoken
+                        )
+                    else:
+                        response = self.cwlogsclient.put_log_events(
+                            logGroupName=self.loggroup, logStreamName=self.logstream,
+                            logEvents=cw_logs_batch
+                        )
+                    if 'nextSequenceToken' in response: self.nexttoken = response['nextSequenceToken']
+                except Exception as e:
+                    log.error(str(e))
+
+            if cw_metrics_batch:
+                try:
+                    cwresponse = self.cwclient.put_metric_data(Namespace=self.namespace,MetricData=cw_metrics_batch)
+                    log.debug("PutMetricData response: [{}]".format(json.dumps(cwresponse, indent=4)))
+                except Exception as e:
+                    log.error(str(e))
+
+
+    def get_batch(self):
+        result = {}
+        cw_logs_batch = []
+        cw_metrics_batch = []
+        if self.response_queue.qsize() >= self.batch_size:
+            for i in range(0, self.batch_size):
+                request_response = self.response_queue.get()
+                cw_logs_batch.append(request_response.get_cw_logs_record())
+                cw_metrics_batch.append(request_response.get_cw_metrics_status_record())
+                cw_metrics_batch.append(request_response.get_cw_metrics_count_record())
+                cw_metrics_batch.append(request_response.get_cw_metrics_usercount_record())
+
+
+                if request_response.get_cw_metrics_response_size_record():
+                    cw_metrics_batch.append(request_response.get_cw_metrics_response_size_record())
+                # if self.usercount: cw_metrics_batch.append(self.usercount.get_metric_data())
+
+                self.response_queue.task_done()
+            log.debug("Queue size:["+str(self.response_queue.qsize())+"]")
+        result['cw_logs_batch']=cw_logs_batch
+        result['cw_metrics_batch']=cw_metrics_batch
+        return result
 
 class RequestResult(object):
-    def __init__(self, host, request_type, name, response_time, response_length, exception, status):
+    def __init__(self, host, user_num, request_type, name, response_time, response_length, exception, status):
         self.timestamp = datetime.datetime.utcnow()
         self.request_type = request_type
         self.name = name
@@ -30,16 +217,17 @@ class RequestResult(object):
         self.host = host
         self.exception = exception
         self.status = status
-
+        self.user_num = user_num
 
     def get_cw_logs_record(self):
+        
         record = {}
-        timestamp = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S.%f UTC")#example: 2016/02/08 16:51:05.123456 CST
+        timestamp = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S.%f UTC")
         message = ""
         if self.status == STATUS_SUCCESS:
-            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [response_length={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.response_length)
+            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [response_length={}] [user={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.response_length, self.user_num)
         if self.status == STATUS_FAILURE:
-            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [exception={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.exception)
+            message = '[timestamp={}] [host={}] [request_type={}] [name={}] [response_time={}] [exception={}] [user={}]'.format(timestamp, self.host, self.request_type, self.name, self.response_time, self.exception, self.user_num)
         record = {'timestamp': self.get_seconds()*1000,'message': message}
         return record
 
@@ -99,6 +287,16 @@ class RequestResult(object):
                   }
         return result
 
+    def get_cw_metrics_usercount_record(self):
+        dimensions = self.get_metric_dimensions()
+        result = {
+                'MetricName': 'UserCount',
+                'Dimensions': dimensions,
+                'Timestamp': self.timestamp,
+                'Value': self.user_num,
+                'Unit': 'Count'
+                  }
+        return result
 
 
     def get_metric_dimensions(self):
@@ -110,6 +308,12 @@ class RequestResult(object):
         epoch = datetime.datetime.utcfromtimestamp(0)
         return int((self.timestamp - epoch).total_seconds())
 
+class MyUser(User):
+    def __init__(self, environment):
+        self.environment = environment
+
+    def get_current_user(self):
+        print("get user!")
 
 class UserCount(object):
     def __init__(self, host,  usercount):
@@ -126,218 +330,53 @@ class UserCount(object):
 
         return result
 
-"""
-Utility class to keep track of time elapsed between events
-"""
-
-class Timestamp():
-
-    def __init__(self):
-        self.eventdict = {}
-
-    def start(self,event):
-        self.eventdict[event] = {}
-        self.eventdict[event]['start'] = datetime.datetime.now()
-        self.eventdict[event]['elapsed'] = 0
-
-    def evaluate(self, event):
-        delta = self.eventdict[event]['start'] - datetime.datetime.now()
-
-
-
-    def finish(self, event):
-        elapsed = datetime.datetime.now() - self.eventdict[event]['start']
-        self.eventdict[event]['elapsed'] = elapsed
-        return elapsed
-
-    def elapsed(self,event):
-        return self.eventdict[event]['elapsed']
-
-
-
-class CloudWatchConnector(object):
-
-    def __init__(self, host, namespace, loggroup, logstream, iamrolearn):
-        seq = datetime.datetime.now().microsecond
-        self.loggroup = loggroup
-        self.logstream = logstream + "_" + str(seq)
-        self.namespace = namespace #the same namespace is used for both CW Logs and Metrics
-        self.nexttoken = ""
-        self.response_queue = queue.Queue()
-        self.batch_size = 5
-        self.host = host
-        self.usercount = None
-        self.iamrolearn = iamrolearn
-        self.lastclientrefresh = None
-
-        self.init_clients()
-
-
-
-        if not self.loggroup_exists():
-            self.cwlogsclient.create_log_group(logGroupName=self.loggroup)
-
-        self.cwlogsclient.create_log_stream(logGroupName=self.loggroup,logStreamName=self.logstream)
-
-
-    #TODO: if using roleArn, find a way to refresh the clients every 59 minutes (before the max duration of temp credentials expires)
-    def init_clients(self):
-        if self.iamrolearn:
-            log.info("Initializing AWS SDK clients using IAM Role:[{}]".format(self.iamrolearn))
-            stsclient = boto3.client('sts')
-            stsresponse = stsclient.assume_role(RoleArn=self.iamrolearn, RoleSessionName='cwlocustconnector')
-            if 'Credentials' in stsresponse:
-                accessKeyId = stsresponse['Credentials']['AccessKeyId']
-                secretAccessKey = stsresponse['Credentials']['SecretAccessKey']
-                sessionToken = stsresponse['Credentials']['SessionToken']
-                self.cwlogsclient = boto3.client('logs',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken)
-                self.cwclient = boto3.client('cloudwatch',aws_access_key_id=accessKeyId, aws_secret_access_key=secretAccessKey,aws_session_token=sessionToken)
-
-        else:
-            log.info("Initializing AWS SDK clients using configured AWS credentials")
-            self.cwlogsclient = boto3.client('logs')
-            self.cwclient = boto3.client('cloudwatch')
-
-        self.lastclientrefresh = datetime.datetime.now()
-
-
-    #See the list of Locust events here: http://docs.locust.io/en/latest/api.html#events
-
-    def on_locust_start_hatching(self, **kwargs):
-        """
-        Event handler that get triggered when start hatching
-        """
-        log.info("Started hatching [{}]".format(kwargs))
-
-    def on_request_success(self, request_type, name, response_time, response_length, **kwargs):
-        request_result = RequestResult(self.host, request_type, name, response_time, response_length, "", STATUS_SUCCESS)
-        self.response_queue.put(request_result)
-
-
-    def on_request_failure(self, request_type, name, response_time, exception, **kwargs):
-        request_result = RequestResult(self.host, request_type, name, response_time, 0, exception, STATUS_FAILURE)
-        self.response_queue.put(request_result)
-
-    def on_request_error(locust_instance, exception, tb, **kwargs):
-        """
-        Event handler that get triggered on every Locust error
-        """
-
-    def on_hatch_complete(self, user_count):
-        #TODO:Register event in CloudWatch Logs
-        self.usercount = UserCount(host=self.host, usercount=user_count)
-        self.start_cw_loop()
-
-
-    def on_quitting(user_count):
-        """
-        Event handler that get triggered when when the locust process is exiting
-        """
-
-    def on_report_to_master(client_id, data):
-        """
-        This event is triggered on the slave instances every time a stats report is
-        to be sent to the locust master. It will allow us to add our extra content-length
-        data to the dict that is being sent, and then we clear the local stats in the slave.
-        """
-
-    def on_slave_report(client_id, data):
-        """
-        This event is triggered on the master instance when a new stats report arrives
-        from a slave. Here we just add the content-length to the master's aggregated
-        stats dict.
-        """
-
-    def loggroup_exists(self):
-        result = False
-        response = self.cwlogsclient.describe_log_groups(logGroupNamePrefix=self.loggroup, limit=1)
-        if len(response['logGroups']): result = True
-        return result
-
-
-
-    def start_cw_loop(self):
-        while True:
-            awsclientage = datetime.datetime.now() - self.lastclientrefresh
-            #Refresh AWS clients every 50 minutes, if using an IAM Role (since credentials expire in 1hr)
-            if self.iamrolearn and awsclientage.total_seconds() > 50*60 :
-                self.init_clients()
-
-            time.sleep(.1)
-            batch = self.get_batch()
-            cw_logs_batch = batch['cw_logs_batch']
-            cw_metrics_batch = batch['cw_metrics_batch']
-            if cw_logs_batch:
-                try:
-                    if self.nexttoken:
-                        response = self.cwlogsclient.put_log_events(
-                            logGroupName=self.loggroup, logStreamName=self.logstream,
-                            logEvents=cw_logs_batch,
-                            sequenceToken=self.nexttoken
-                        )
-                    else:
-                        response = self.cwlogsclient.put_log_events(
-                            logGroupName=self.loggroup, logStreamName=self.logstream,
-                            logEvents=cw_logs_batch
-                        )
-                    if 'nextSequenceToken' in response: self.nexttoken = response['nextSequenceToken']
-                except Exception as e:
-                    log.error(str(e))
-
-            if cw_metrics_batch:
-                try:
-                    cwresponse = self.cwclient.put_metric_data(Namespace=self.namespace,MetricData=cw_metrics_batch)
-                    log.debug("PutMetricData response: [{}]".format(json.dumps(cwresponse, indent=4)))
-                except Exception as e:
-                    log.error(str(e))
-
-
-    """
-    Metric and Log data has to be batched before writing to the CloudWatch API.
-    """
-    def get_batch(self):
-        result = {}
-        cw_logs_batch = []
-        cw_metrics_batch = []
-        if self.response_queue.qsize() >= self.batch_size:
-            for i in range(0, self.batch_size):
-                request_response = self.response_queue.get()
-                cw_logs_batch.append(request_response.get_cw_logs_record())
-                cw_metrics_batch.append(request_response.get_cw_metrics_status_record())
-                cw_metrics_batch.append(request_response.get_cw_metrics_count_record())
-                if request_response.get_cw_metrics_response_size_record():
-                    cw_metrics_batch.append(request_response.get_cw_metrics_response_size_record())
-                if self.usercount: cw_metrics_batch.append(self.usercount.get_metric_data())
-
-                self.response_queue.task_done()
-            log.debug("Queue size:["+str(self.response_queue.qsize())+"]")
-        result['cw_logs_batch']=cw_logs_batch
-        result['cw_metrics_batch']=cw_metrics_batch
-        return result
-
 
 @events.request.add_listener
 def my_req_handler(request_type, name, response_time, response_length, response,
                        context, exception, start_time, url, **kwargs):
+
+    # print("-> current runner : ", cwconn.get_runner())
+    current_user_count = cwconn.get_runner()
+
+    # Failure
     if exception:
-        print(f"Request to {name} failed with exception {exception}")
+        # print(f"Request to {name} failed with exception {exception}")
+        cwconn.on_request_failure(current_user_count, request_type, name, response_time, exception, **kwargs)
+    # Success
     else:
-        print(f"Successfully made a request to: {name}")
+        # print(f"Successfully made a request to: {name}")
         # print(f"The response was {response.text}")
-        print(f"The response len {len(response.text)}")
+        # print(f"The response len {len(response.text)}")
+        cwconn.on_request_success(current_user_count, request_type, name, response_time, response_length, **kwargs)
+
+    if cwconn.live_upload:
+        cwconn.live_post()
+
+@events.quitting.add_listener 
+def dlt_complete_handler(environment, **kargs):
+    cwconn.on_dlt_complete(environment)
+
+    print("Distribute Load Test Completed")
+
+@events.spawning_complete.add_listener
+def spawning_check(user_count, **kwargs):
+    print("spawning completed : ", user_count)
+
+@events.test_start.add_listener
+def on_locust_init(environment, **_kwargs):
+    cwconn.on_start(environment)
+    
+
+@events.init_command_line_parser.add_listener
+def _(parser):
+    parser.add_argument("--live", default=False, type=bool, help="live posting")
 
 
 if __name__ == "__main__":
 
-   #parser, options, arguments = main.parse_options()
-#    parser, options = main.parse_options()
-
    host = 'http://exam.viassh.com'
-#    if options.host:
-#        host = options.host
 
-   #this parameter is supported in case the load generator publishes metrics to CloudWatch in a different AWS account
-   iamrolearn = 'arn:aws:iam::336481557929:role/ec2AndCloudwatchFull'
+   iamrolearn = IAM_ROLE_ARN
 
    
 #    if 'IAM_ROLE_ARN' in os.environ:
@@ -345,10 +384,5 @@ if __name__ == "__main__":
 
 
    cwconn = CloudWatchConnector(host=host, namespace=CW_METRICS_NAMESPACE,loggroup=CW_LOGS_LOG_GROUP,logstream=CW_LOGS_LOG_STREAM, iamrolearn=iamrolearn)
-
-#    events.locust_start_hatching += cwconn.on_locust_start_hatching
-#    events.request_success += cwconn.on_request_success
-#    events.request_failure += cwconn.on_request_failure
-#    events.hatch_complete += cwconn.on_hatch_complete
 
    main.main()

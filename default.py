@@ -8,7 +8,7 @@ class QuickstartUser(HttpUser):
     def main_page(self):
         self.client.get("/")
         self.client.get("/docs")
-        self.client.post("/api/user/signin", json={"email":"aaa@asdf.com", "password":"qqqq123"})
+        self.client.post("/api/user/signin", json={"email":"abc@def.com", "password":"1q2w3e"})
         
 
     # @task(3)
